@@ -8,9 +8,9 @@ use crate::media;
 use crate::remind::{self, ReminderStore};
 use async_trait::async_trait;
 use serenity::builder::{
-    CreateActionRow, CreateButton, CreateCommand, CreateCommandOption, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
-    CreateSelectMenuOption, CreateThread, EditMessage,
+    CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateSelectMenu,
+    CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
@@ -173,6 +173,25 @@ impl ChatAdapter for DiscordAdapter {
                 MessageId::new(msg_id),
                 &ReactionType::Unicode(emoji.to_string()),
             )
+            .await?;
+        Ok(())
+    }
+
+    async fn send_attachments(
+        &self,
+        channel: &ChannelRef,
+        paths: &[std::path::PathBuf],
+    ) -> anyhow::Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let ch_id: u64 = channel.channel_id.parse()?;
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            files.push(CreateAttachment::path(path).await?);
+        }
+        ChannelId::new(ch_id)
+            .send_files(&self.http, files, CreateMessage::new())
             .await?;
         Ok(())
     }
@@ -639,9 +658,11 @@ impl EventHandler for Handler {
         );
 
         // Build extra content blocks from attachments (audio -> STT, text -> inline,
-        // image -> encode, video -> URL for agent-side inspection).
+        // image -> encode, video -> URL for agent-side inspection,
+        // other -> workspace persist + resource_link).
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
+        let mut persisted_attachments: Vec<media::PersistedAttachment> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
@@ -726,12 +747,43 @@ impl EventHandler for Handler {
                     u64::from(attachment.size),
                     &attachment.url,
                 ));
+            } else if !media::is_image_type(&attachment.filename, attachment.content_type.as_deref()) {
+                // 4th branch: anything we didn't already handle (audio/STT,
+                // text/inline, image/encode, video/URL) gets persisted under
+                // the agent workspace and handed over as a resource_link.
+                // The image-type gate prevents oversize/corrupt images from
+                // being silently routed through persistence.
+                let working_dir = std::path::Path::new(self.router.working_dir());
+                if let Some(persisted) = media::persist_attachment_from_url(
+                    working_dir,
+                    &attachment.url,
+                    &attachment.filename,
+                    u64::from(attachment.size),
+                    attachment.content_type.as_deref(),
+                    "discord",
+                    &msg.channel_id.to_string(),
+                    &msg.id.to_string(),
+                    None,
+                )
+                .await
+                {
+                    debug!(filename = %attachment.filename, "persisted attachment for workspace handoff");
+                    extra_blocks.push(persisted.to_content_block());
+                    persisted_attachments.push(persisted);
+                }
             }
+        }
+
+        // Prepend a [Attached files] summary so the agent sees the full manifest
+        // as readable text even when it can't open the persisted files yet.
+        if let Some(summary) = media::build_attachment_summary(&persisted_attachments) {
+            extra_blocks.insert(0, ContentBlock::Text { text: summary });
         }
 
         tracing::debug!(
             num_extra_blocks = extra_blocks.len(),
             num_attachments = msg.attachments.len(),
+            num_persisted = persisted_attachments.len(),
             in_thread,
             "processing"
         );

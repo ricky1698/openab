@@ -117,6 +117,10 @@ impl ThreadHandle {
 pub trait DispatchTarget: Send + Sync + 'static {
     fn reactions_config(&self) -> &ReactionsConfig;
 
+    /// The agent's working directory — needed by adapters to persist inbound
+    /// attachments under the agent's workspace (4th-branch handoff).
+    fn working_dir(&self) -> &str;
+
     /// Ensure the ACP session for `session_key` exists (idempotent).
     async fn ensure_session(&self, session_key: &str) -> Result<()>;
 
@@ -137,6 +141,10 @@ pub trait DispatchTarget: Send + Sync + 'static {
 impl DispatchTarget for AdapterRouter {
     fn reactions_config(&self) -> &ReactionsConfig {
         AdapterRouter::reactions_config(self)
+    }
+
+    fn working_dir(&self) -> &str {
+        AdapterRouter::working_dir(self)
     }
 
     async fn ensure_session(&self, session_key: &str) -> Result<()> {
@@ -260,6 +268,12 @@ impl Dispatcher {
     /// Note: this is the *dispatcher* key, not the *session pool* key. Session pool keys
     /// are always `<platform>:<thread_id>` regardless of grouping (the ACP session is
     /// shared per-thread by design).
+    /// Forward the underlying target's `working_dir` so adapters can resolve
+    /// the agent's workspace path without holding a direct router reference.
+    pub fn working_dir(&self) -> &str {
+        self.target.working_dir()
+    }
+
     pub fn key(&self, platform: &str, thread_id: &str, sender_id: &str) -> String {
         match self.grouping {
             BatchGrouping::Thread => format!("{platform}:{thread_id}"),
@@ -717,6 +731,13 @@ pub fn estimate_tokens(prompt: &str, extra_blocks: &[ContentBlock]) -> usize {
         .map(|b| match b {
             ContentBlock::Text { text } => text.len() / CHARS_PER_TOKEN_ESTIMATE + 1,
             ContentBlock::Image { .. } => TOKENS_PER_IMAGE_ESTIMATE,
+            // ResourceLink is a tiny pointer (uri + name + mime + size). Resource
+            // carries inline text — charge it like a text block. Both are coarse
+            // estimates for the batch cap, not exact pre-flight numbers.
+            ContentBlock::ResourceLink { uri, name, .. } => {
+                (uri.len() + name.len()) / CHARS_PER_TOKEN_ESTIMATE + 1
+            }
+            ContentBlock::Resource { text, .. } => text.len() / CHARS_PER_TOKEN_ESTIMATE + 1,
         })
         .sum();
     text_tokens + block_tokens
@@ -1261,6 +1282,10 @@ mod tests {
     impl DispatchTarget for MockDispatchTarget {
         fn reactions_config(&self) -> &ReactionsConfig {
             &self.reactions
+        }
+
+        fn working_dir(&self) -> &str {
+            ""
         }
 
         async fn ensure_session(&self, _session_key: &str) -> Result<()> {

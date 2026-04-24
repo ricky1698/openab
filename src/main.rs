@@ -10,6 +10,7 @@ mod format;
 mod gateway;
 mod markdown;
 mod media;
+mod outbound;
 mod reactions;
 mod remind;
 mod setup;

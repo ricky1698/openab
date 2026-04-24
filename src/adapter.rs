@@ -260,6 +260,17 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// not be detected until the next message. This is acceptable: the first
     /// response may stream, but subsequent ones will correctly use send-once.
     fn use_streaming(&self, other_bot_present: bool) -> bool;
+
+    /// Upload local files to the channel (outbound attachment path).
+    /// Called by the router when the agent's reply references images inside
+    /// the workspace. Default no-op so adapters that don't need it can opt out.
+    async fn send_attachments(
+        &self,
+        _channel: &ChannelRef,
+        _paths: &[std::path::PathBuf],
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 // --- AdapterRouter ---
@@ -309,6 +320,11 @@ impl AdapterRouter {
     /// Access the reactions config (used by dispatch.rs).
     pub fn reactions_config(&self) -> &ReactionsConfig {
         &self.reactions_config
+    }
+
+    /// The agent's working directory (forwarded from the session pool).
+    pub fn working_dir(&self) -> &str {
+        self.pool.working_dir()
     }
 
     /// Pack one arrival event into ContentBlocks. Per-arrival layout:
@@ -464,6 +480,7 @@ impl AdapterRouter {
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        let working_dir = self.working_dir().to_string();
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -669,6 +686,14 @@ impl AdapterRouter {
                     };
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
+
+                    // Outbound: rewrite `![](local-path)` references into bare
+                    // alt text and collect the real files for upload. Keeps
+                    // `https://` / `data:` / out-of-workspace refs untouched.
+                    let (final_content, outbound_paths) = crate::outbound::extract_local_image_uploads(
+                        &final_content,
+                        std::path::Path::new(&working_dir),
+                    );
                     let chunks = format::split_message(&final_content, message_limit);
                     if let Some(msg) = placeholder_msg {
                         if let Some(ref reply_id) = directives.reply_to {
@@ -726,6 +751,18 @@ impl AdapterRouter {
                                 let _ = adapter.send_message(&thread_channel, chunk).await;
                             }
                             first = false;
+                        }
+                    }
+
+                    if !outbound_paths.is_empty() {
+                        if let Err(e) = adapter.send_attachments(&thread_channel, &outbound_paths).await {
+                            error!("outbound attachment upload failed: {e}");
+                            let _ = adapter
+                                .send_message(
+                                    &thread_channel,
+                                    &format!("⚠️ failed to upload attachment(s): {e}"),
+                                )
+                                .await;
                         }
                     }
 

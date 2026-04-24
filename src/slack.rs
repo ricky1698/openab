@@ -437,6 +437,64 @@ impl ChatAdapter for SlackAdapter {
     fn use_streaming(&self, other_bot_present: bool) -> bool {
         !other_bot_present
     }
+
+    async fn send_attachments(
+        &self,
+        channel: &ChannelRef,
+        paths: &[std::path::PathBuf],
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        // Slack external upload is three calls:
+        //   1. files.getUploadURLExternal (per file) → upload_url + file_id
+        //   2. POST bytes to upload_url
+        //   3. files.completeUploadExternal (batched, optional thread_ts)
+        let mut completed: Vec<serde_json::Value> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+            let filename = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("attachment")
+                .to_string();
+            let length_str = bytes.len().to_string();
+            let init = self
+                .api_get(
+                    "files.getUploadURLExternal",
+                    &[("filename", &filename), ("length", &length_str)],
+                )
+                .await?;
+            let upload_url = init["upload_url"]
+                .as_str()
+                .ok_or_else(|| anyhow!("missing upload_url"))?;
+            let file_id = init["file_id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("missing file_id"))?;
+            let resp = self
+                .client
+                .post(upload_url)
+                .header("Authorization", format!("Bearer {}", self.bot_token))
+                .body(bytes)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("slack upload POST returned {}", resp.status()));
+            }
+            completed.push(serde_json::json!({"id": file_id, "title": filename}));
+        }
+        let mut body = serde_json::json!({
+            "files": completed,
+            "channel_id": channel.channel_id,
+        });
+        if let Some(thread_ts) = &channel.thread_id {
+            body["thread_ts"] = serde_json::Value::String(thread_ts.clone());
+        }
+        self.api_post("files.completeUploadExternal", body).await?;
+        Ok(())
+    }
 }
 
 // --- Socket Mode event loop ---
@@ -932,6 +990,7 @@ async fn handle_message(
 
     let mut extra_blocks = Vec::new();
     let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
+    let mut persisted_attachments: Vec<media::PersistedAttachment> = Vec::new();
     let mut text_file_bytes: u64 = 0;
     let mut text_file_count: u32 = 0;
 
@@ -1043,8 +1102,35 @@ async fn handle_message(
             {
                 debug!(filename, "adding image attachment");
                 extra_blocks.push(block);
+            } else if !media::is_image_type(filename, Some(mimetype)) {
+                // 4th branch: unsupported by audio/text/image handlers —
+                // persist under the workspace and hand over a resource_link.
+                // `is_image_type` guard prevents oversize/corrupt images from
+                // silently routing through persistence.
+                let working_dir = std::path::Path::new(dispatcher.working_dir());
+                if let Some(persisted) = media::persist_attachment_from_url(
+                    working_dir,
+                    url,
+                    filename,
+                    size,
+                    Some(mimetype),
+                    "slack",
+                    &channel_id,
+                    &ts,
+                    Some(bot_token),
+                ).await {
+                    debug!(filename, "persisted attachment for workspace handoff");
+                    extra_blocks.push(persisted.to_content_block());
+                    persisted_attachments.push(persisted);
+                }
             }
         }
+    }
+
+    // Prepend a [Attached files] manifest so the agent sees the list as text
+    // even when it hasn't opened the workspace files yet.
+    if let Some(summary) = media::build_attachment_summary(&persisted_attachments) {
+        extra_blocks.insert(0, ContentBlock::Text { text: summary });
     }
 
     // Resolve Slack display name (best-effort, fallback to user_id)

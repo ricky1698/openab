@@ -4,6 +4,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use image::ImageReader;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tracing::{debug, error};
 
@@ -337,6 +338,215 @@ pub async fn download_and_read_text_file(
     ))
 }
 
+// --- Workspace attachment handoff (unsupported file types) ---
+//
+// These helpers cover the fourth branch of the adapter attachment loop: when
+// an attachment is neither audio (handled by STT), nor a recognised text file
+// (inlined into the prompt), nor an image (base64-encoded), we persist it
+// under the agent's working directory so the agent can read it from its
+// filesystem, and emit a `ContentBlock::ResourceLink` pointing at the
+// saved path. The original audio / text / image branches are untouched.
+
+/// Maximum size for a workspace-handoff attachment (25 MB).
+const ATTACHMENT_MAX_SIZE: u64 = 25 * 1024 * 1024;
+
+/// Returns true if the filename extension or MIME hint matches a type that
+/// `download_and_encode_image` would accept. Used by the 4th-branch gate so
+/// oversized / corrupt images aren't silently routed through persistence.
+pub fn is_image_type(filename: &str, mime_hint: Option<&str>) -> bool {
+    if let Some(mime) = mime_hint {
+        let base = mime.split(';').next().unwrap_or(mime).trim();
+        if base.starts_with("image/") {
+            return true;
+        }
+    }
+    filename
+        .rsplit('.')
+        .next()
+        .map(str::to_lowercase)
+        .map(|ext| matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"))
+        .unwrap_or(false)
+}
+
+/// Sanitize a user-supplied string into a safe single path segment.
+/// Keeps ASCII `[A-Za-z0-9._-]`, replaces everything else with `_`, trims
+/// leading/trailing dots, and falls back to `fallback` if the result is empty.
+pub fn sanitize_path_segment(input: &str, fallback: &str) -> String {
+    let sanitized: String = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// A chat attachment that has been downloaded and saved under the agent's
+/// working directory. Carries enough context to build the ACP resource block
+/// and a human-readable summary line for the prompt.
+#[derive(Debug, Clone)]
+pub struct PersistedAttachment {
+    uri: String,
+    relative_path: String,
+    filename: String,
+    mime_type: String,
+    size: u64,
+}
+
+impl PersistedAttachment {
+    /// Build the ACP content block pointing at this attachment. The
+    /// capability-aware serializer in `acp::connection` will transmit it as
+    /// `resource_link`; agents without `embeddedContext` handle it natively.
+    pub fn to_content_block(&self) -> ContentBlock {
+        ContentBlock::ResourceLink {
+            uri: self.uri.clone(),
+            name: self.filename.clone(),
+            mime_type: self.mime_type.clone(),
+            size: self.size,
+        }
+    }
+}
+
+/// Download an attachment and persist it under
+/// `<working_dir>/.openab/attachments/<platform>/<channel>/<message>/<filename>`.
+/// Returns `None` if any step fails (download, write, cap) — callers treat
+/// this as a best-effort drop rather than a hard error.
+#[allow(clippy::too_many_arguments)]
+pub async fn persist_attachment_from_url(
+    working_dir: &Path,
+    url: &str,
+    filename: &str,
+    size_hint: u64,
+    mime_hint: Option<&str>,
+    platform: &str,
+    channel_id: &str,
+    message_id: &str,
+    auth_token: Option<&str>,
+) -> Option<PersistedAttachment> {
+    if url.is_empty() {
+        return None;
+    }
+    if size_hint > ATTACHMENT_MAX_SIZE {
+        tracing::warn!(
+            filename,
+            size = size_hint,
+            limit = ATTACHMENT_MAX_SIZE,
+            "attachment exceeds workspace-handoff limit, skipping"
+        );
+        return None;
+    }
+
+    let mut req = HTTP_CLIENT.get(url);
+    if let Some(token) = auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url, error = %e, "attachment download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(url, status = %resp.status(), "attachment download failed");
+        return None;
+    }
+    let header_mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(url, error = %e, "attachment read failed");
+            return None;
+        }
+    };
+    let actual_size = bytes.len() as u64;
+    if actual_size > ATTACHMENT_MAX_SIZE {
+        tracing::warn!(
+            filename,
+            size = actual_size,
+            "downloaded attachment exceeds workspace-handoff limit"
+        );
+        return None;
+    }
+
+    let mime = mime_hint
+        .map(str::to_string)
+        .or(header_mime)
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let mime = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime.as_str())
+        .trim()
+        .to_string();
+
+    let rel_dir = PathBuf::from(".openab")
+        .join("attachments")
+        .join(sanitize_path_segment(platform, "platform"))
+        .join(sanitize_path_segment(channel_id, "channel"))
+        .join(sanitize_path_segment(message_id, "message"));
+    let full_dir = working_dir.join(&rel_dir);
+    if let Err(e) = tokio::fs::create_dir_all(&full_dir).await {
+        tracing::warn!(dir = %full_dir.display(), error = %e, "failed to create attachments dir");
+        return None;
+    }
+    let safe_filename = sanitize_path_segment(filename, "attachment");
+    let full_path = full_dir.join(&safe_filename);
+    if let Err(e) = tokio::fs::write(&full_path, &bytes).await {
+        tracing::warn!(path = %full_path.display(), error = %e, "failed to write attachment");
+        return None;
+    }
+
+    let absolute = full_path.canonicalize().unwrap_or_else(|_| full_path.clone());
+    let uri = format!("file://{}", absolute.to_string_lossy());
+    let relative_path = rel_dir
+        .join(&safe_filename)
+        .to_string_lossy()
+        .into_owned();
+
+    debug!(filename = %safe_filename, size = actual_size, path = %relative_path, "attachment persisted");
+
+    Some(PersistedAttachment {
+        uri,
+        relative_path,
+        filename: safe_filename,
+        mime_type: mime,
+        size: actual_size,
+    })
+}
+
+/// Compose a "[Attached files]" summary text block listing each persisted
+/// attachment by filename + size + relative path. Returns `None` when the
+/// list is empty so the caller can skip prepending an empty summary.
+pub fn build_attachment_summary(persisted: &[PersistedAttachment]) -> Option<String> {
+    if persisted.is_empty() {
+        return None;
+    }
+    use std::fmt::Write as _;
+    let mut out = String::from("[Attached files]\n");
+    for att in persisted {
+        let _ = writeln!(
+            out,
+            "- {} ({}, {} bytes) — saved at {}",
+            att.filename, att.mime_type, att.size, att.relative_path,
+        );
+    }
+    Some(out.trim_end().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +638,78 @@ mod tests {
         assert!(is_video_file("clip.mp4", None));
         assert!(is_video_file("clip.MOV", None));
         assert!(!is_video_file("notes.txt", Some("text/plain")));
+    }
+
+    #[test]
+    fn sanitize_path_segment_applies_whitelist_and_fallback() {
+        assert_eq!(sanitize_path_segment("log.txt", "x"), "log.txt");
+        assert_eq!(
+            sanitize_path_segment("report with spaces.pdf", "x"),
+            "report_with_spaces.pdf"
+        );
+        assert_eq!(sanitize_path_segment("日本語.zip", "x"), "___.zip");
+        // `/` → `_`, then leading dots stripped to block path traversal.
+        assert_eq!(sanitize_path_segment("../evil", "x"), "_evil");
+        assert_eq!(sanitize_path_segment("", "fallback"), "fallback");
+        assert_eq!(sanitize_path_segment("....", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn is_image_type_accepts_known_mime_and_extension() {
+        assert!(is_image_type("cat.PNG", None));
+        assert!(is_image_type("cat", Some("image/jpeg")));
+        assert!(is_image_type("cat.webp", Some("application/octet-stream")));
+        assert!(!is_image_type("report.pdf", Some("application/pdf")));
+        assert!(!is_image_type("notes.md", None));
+        assert!(!is_image_type("", None));
+    }
+
+    fn fake_persisted(filename: &str, size: u64) -> PersistedAttachment {
+        PersistedAttachment {
+            uri: format!("file:///w/{filename}"),
+            relative_path: format!(".openab/attachments/discord/c/m/{filename}"),
+            filename: filename.to_string(),
+            mime_type: "application/pdf".to_string(),
+            size,
+        }
+    }
+
+    #[test]
+    fn attachment_summary_lists_all_entries() {
+        let persisted = vec![
+            fake_persisted("a.pdf", 1234),
+            fake_persisted("b.pdf", 5678),
+        ];
+        let summary = build_attachment_summary(&persisted).expect("non-empty");
+        assert!(summary.starts_with("[Attached files]"));
+        assert!(summary.contains("a.pdf"));
+        assert!(summary.contains("1234"));
+        assert!(summary.contains("b.pdf"));
+        assert!(summary.contains("5678"));
+        assert!(summary.contains(".openab/attachments/discord/c/m/a.pdf"));
+    }
+
+    #[test]
+    fn attachment_summary_is_none_for_empty_list() {
+        assert!(build_attachment_summary(&[]).is_none());
+    }
+
+    #[test]
+    fn persisted_attachment_produces_resource_link() {
+        let att = fake_persisted("data.bin", 99);
+        match att.to_content_block() {
+            ContentBlock::ResourceLink {
+                uri,
+                name,
+                mime_type,
+                size,
+            } => {
+                assert_eq!(uri, "file:///w/data.bin");
+                assert_eq!(name, "data.bin");
+                assert_eq!(mime_type, "application/pdf");
+                assert_eq!(size, 99);
+            }
+            _ => panic!("expected ResourceLink"),
+        }
     }
 }
