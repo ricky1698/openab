@@ -6,6 +6,7 @@ mod discord;
 mod error_display;
 mod format;
 mod media;
+mod outbound;
 mod reactions;
 mod setup;
 mod slack;

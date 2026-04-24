@@ -7,7 +7,7 @@ use crate::format;
 use crate::media;
 use async_trait::async_trait;
 use std::sync::LazyLock;
-use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage};
+use serenity::builder::{CreateActionRow, CreateAttachment, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage};
 use serenity::http::Http;
 use serenity::model::application::{ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
@@ -118,6 +118,25 @@ impl ChatAdapter for DiscordAdapter {
                 MessageId::new(msg_id),
                 &ReactionType::Unicode(emoji.to_string()),
             )
+            .await?;
+        Ok(())
+    }
+
+    async fn send_attachments(
+        &self,
+        channel: &ChannelRef,
+        paths: &[std::path::PathBuf],
+    ) -> anyhow::Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let ch_id: u64 = channel.channel_id.parse()?;
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            files.push(CreateAttachment::path(path).await?);
+        }
+        ChannelId::new(ch_id)
+            .send_files(&self.http, files, CreateMessage::new())
             .await?;
         Ok(())
     }
@@ -500,8 +519,10 @@ impl EventHandler for Handler {
             is_bot: msg.author.bot,
         };
 
-        // Build extra content blocks from attachments (audio → STT, text → inline, image → encode)
+        // Build extra content blocks from attachments (audio → STT, text → inline, image → encode,
+        // other → workspace persist + resource_link).
         let mut extra_blocks = Vec::new();
+        let mut persisted_attachments: Vec<media::PersistedAttachment> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
@@ -561,12 +582,40 @@ impl EventHandler for Handler {
             ).await {
                 debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
                 extra_blocks.push(block);
+            } else if !media::is_image_type(&attachment.filename, attachment.content_type.as_deref()) {
+                // 4th branch: neither audio, nor text, nor a (handleable) image —
+                // persist to the agent workspace and hand over a resource_link.
+                // The image-type gate prevents oversize/corrupt images from being
+                // silently routed through persistence.
+                let working_dir = std::path::Path::new(self.router.working_dir());
+                if let Some(persisted) = media::persist_attachment_from_url(
+                    working_dir,
+                    &attachment.url,
+                    &attachment.filename,
+                    u64::from(attachment.size),
+                    attachment.content_type.as_deref(),
+                    "discord",
+                    &msg.channel_id.to_string(),
+                    &msg.id.to_string(),
+                    None,
+                ).await {
+                    debug!(filename = %attachment.filename, "persisted attachment for workspace handoff");
+                    extra_blocks.push(persisted.to_content_block());
+                    persisted_attachments.push(persisted);
+                }
             }
+        }
+
+        // Prepend a [Attached files] summary so the agent sees the full manifest
+        // as readable text even when it can't open the persisted files yet.
+        if let Some(summary) = media::build_attachment_summary(&persisted_attachments) {
+            extra_blocks.insert(0, ContentBlock::Text { text: summary });
         }
 
         tracing::debug!(
             num_extra_blocks = extra_blocks.len(),
             num_attachments = msg.attachments.len(),
+            num_persisted = persisted_attachments.len(),
             in_thread,
             "processing"
         );

@@ -75,6 +75,12 @@ impl SessionPool {
         }
     }
 
+    /// The agent's working directory (cwd for spawned agent processes).
+    /// Used by adapters to resolve paths for workspace attachment handoff.
+    pub fn working_dir(&self) -> &str {
+        &self.config.working_dir
+    }
+
     pub async fn get_or_create(&self, thread_id: &str) -> Result<()> {
         let create_gate = {
             let mut state = self.state.write().await;
