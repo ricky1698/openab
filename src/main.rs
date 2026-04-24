@@ -8,6 +8,7 @@ mod error_display;
 mod format;
 mod markdown;
 mod media;
+mod outbound;
 mod reactions;
 mod setup;
 mod slack;

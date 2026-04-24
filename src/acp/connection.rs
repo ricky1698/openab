@@ -83,27 +83,115 @@ fn expand_env(val: &str) -> String {
 }
 use tokio::time::Instant;
 
-/// A content block for the ACP prompt — either text or image.
+/// Prompt-side capabilities advertised by the agent during `initialize`.
+/// Used to decide whether a ContentBlock can be sent as-is or must be
+/// transparently downgraded (e.g. `Resource` → `resource_link` when the
+/// agent does not support embedded context).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PromptCapabilities {
+    pub image: bool,
+    pub audio: bool,
+    pub embedded_context: bool,
+}
+
+/// A content block for the ACP prompt.
 #[derive(Debug, Clone)]
 pub enum ContentBlock {
-    Text { text: String },
-    Image { media_type: String, data: String },
+    Text {
+        text: String,
+    },
+    Image {
+        media_type: String,
+        data: String,
+    },
+    /// Points to a workspace file without embedding its contents.
+    ResourceLink {
+        uri: String,
+        name: String,
+        mime_type: String,
+        size: u64,
+    },
+    /// Embeds the full text contents of a small workspace file. Falls back to
+    /// a `ResourceLink` when the agent does not support `embeddedContext`.
+    // Constructed by media::persist_attachment_from_url in a later phase.
+    #[allow(dead_code)]
+    Resource {
+        uri: String,
+        name: String,
+        mime_type: String,
+        size: u64,
+        text: String,
+    },
 }
 
 impl ContentBlock {
-    pub fn to_json(&self) -> Value {
+    /// Serialize into the ACP `session/prompt` block form. Returns `None` when
+    /// the block cannot be transmitted under the given capabilities (e.g. an
+    /// `Image` block for an agent without `promptCapabilities.image`), so the
+    /// caller drops it rather than sending a malformed prompt.
+    fn to_json(&self, capabilities: PromptCapabilities) -> Option<Value> {
         match self {
-            ContentBlock::Text { text } => json!({
+            ContentBlock::Text { text } => Some(json!({
                 "type": "text",
                 "text": text
+            })),
+            ContentBlock::Image { media_type, data } => capabilities.image.then(|| {
+                json!({
+                    "type": "image",
+                    "data": data,
+                    "mimeType": media_type
+                })
             }),
-            ContentBlock::Image { media_type, data } => json!({
-                "type": "image",
-                "data": data,
-                "mimeType": media_type
-            }),
+            ContentBlock::ResourceLink {
+                uri,
+                name,
+                mime_type,
+                size,
+            } => Some(json!({
+                "type": "resource_link",
+                "uri": uri,
+                "name": name,
+                "mimeType": mime_type,
+                "size": size,
+            })),
+            ContentBlock::Resource {
+                uri,
+                name,
+                mime_type,
+                size,
+                text,
+            } => {
+                if capabilities.embedded_context {
+                    Some(json!({
+                        "type": "resource",
+                        "resource": {
+                            "uri": uri,
+                            "mimeType": mime_type,
+                            "text": text,
+                        }
+                    }))
+                } else {
+                    ContentBlock::ResourceLink {
+                        uri: uri.clone(),
+                        name: name.clone(),
+                        mime_type: mime_type.clone(),
+                        size: *size,
+                    }
+                    .to_json(capabilities)
+                }
+            }
         }
     }
+}
+
+pub(crate) fn serialize_content_blocks(
+    blocks: &[ContentBlock],
+    capabilities: PromptCapabilities,
+) -> Vec<Value> {
+    blocks
+        .iter()
+        .filter_map(|block| block.to_json(capabilities))
+        .collect()
 }
 
 pub struct AcpConnection {
@@ -117,6 +205,7 @@ pub struct AcpConnection {
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
     pub config_options: Vec<ConfigOption>,
+    prompt_capabilities: PromptCapabilities,
     pub last_active: Instant,
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
@@ -339,6 +428,7 @@ impl AcpConnection {
             acp_session_id: None,
             supports_load_session: false,
             config_options: Vec::new(),
+            prompt_capabilities: PromptCapabilities::default(),
             last_active: Instant::now(),
             session_reset: false,
             _reader_handle: reader_handle,
@@ -403,7 +493,31 @@ impl AcpConnection {
             .and_then(|c| c.get("loadSession"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        info!(agent = agent_name, load_session = self.supports_load_session, "initialized");
+        let prompt_capabilities_json = result
+            .and_then(|r| r.get("agentCapabilities"))
+            .and_then(|c| c.get("promptCapabilities"));
+        self.prompt_capabilities = PromptCapabilities {
+            image: prompt_capabilities_json
+                .and_then(|c| c.get("image"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            audio: prompt_capabilities_json
+                .and_then(|c| c.get("audio"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            embedded_context: prompt_capabilities_json
+                .and_then(|c| c.get("embeddedContext"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        };
+        info!(
+            agent = agent_name,
+            load_session = self.supports_load_session,
+            prompt_image = self.prompt_capabilities.image,
+            prompt_audio = self.prompt_capabilities.audio,
+            embedded_context = self.prompt_capabilities.embedded_context,
+            "initialized"
+        );
         Ok(())
     }
 
@@ -502,11 +616,10 @@ impl AcpConnection {
 
         let id = self.next_id();
 
-        // Convert content blocks to JSON
-        let prompt_json: Vec<Value> = content_blocks
-            .iter()
-            .map(|b| b.to_json())
-            .collect();
+        // Convert content blocks to JSON, filtering out ones the agent cannot
+        // accept and transparently degrading Resource → ResourceLink when the
+        // agent lacks embeddedContext.
+        let prompt_json = serialize_content_blocks(&content_blocks, self.prompt_capabilities);
 
         let req = JsonRpcRequest::new(
             id,
@@ -594,8 +707,100 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
+    use super::{
+        build_agent_env, build_permission_response, pick_best_option, serialize_content_blocks,
+        ContentBlock, PromptCapabilities,
+    };
     use serde_json::json;
+
+    #[test]
+    fn resource_downgrades_to_resource_link_when_embedded_context_unsupported() {
+        let blocks = vec![ContentBlock::Resource {
+            uri: "file:///w/log.txt".into(),
+            name: "log.txt".into(),
+            mime_type: "text/plain".into(),
+            size: 42,
+            text: "hello".into(),
+        }];
+        let caps = PromptCapabilities {
+            image: false,
+            audio: false,
+            embedded_context: false,
+        };
+
+        let out = serialize_content_blocks(&blocks, caps);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "resource_link");
+        assert_eq!(out[0]["uri"], "file:///w/log.txt");
+        assert_eq!(out[0]["name"], "log.txt");
+        assert_eq!(out[0]["mimeType"], "text/plain");
+        assert_eq!(out[0]["size"], 42);
+    }
+
+    #[test]
+    fn resource_stays_embedded_when_agent_supports_embedded_context() {
+        let blocks = vec![ContentBlock::Resource {
+            uri: "file:///w/log.txt".into(),
+            name: "log.txt".into(),
+            mime_type: "text/plain".into(),
+            size: 5,
+            text: "hello".into(),
+        }];
+        let caps = PromptCapabilities {
+            image: false,
+            audio: false,
+            embedded_context: true,
+        };
+
+        let out = serialize_content_blocks(&blocks, caps);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "resource");
+        assert_eq!(out[0]["resource"]["uri"], "file:///w/log.txt");
+        assert_eq!(out[0]["resource"]["mimeType"], "text/plain");
+        assert_eq!(out[0]["resource"]["text"], "hello");
+    }
+
+    #[test]
+    fn image_blocks_are_dropped_when_image_capability_is_disabled() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "surrounding".into(),
+            },
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "BASE64".into(),
+            },
+        ];
+        let caps = PromptCapabilities::default();
+
+        let out = serialize_content_blocks(&blocks, caps);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "text");
+        assert_eq!(out[0]["text"], "surrounding");
+    }
+
+    #[test]
+    fn resource_link_passes_through_unchanged() {
+        let blocks = vec![ContentBlock::ResourceLink {
+            uri: "file:///w/bin.pdf".into(),
+            name: "bin.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: 1024,
+        }];
+        let caps = PromptCapabilities::default();
+
+        let out = serialize_content_blocks(&blocks, caps);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "resource_link");
+        assert_eq!(out[0]["uri"], "file:///w/bin.pdf");
+        assert_eq!(out[0]["name"], "bin.pdf");
+        assert_eq!(out[0]["mimeType"], "application/pdf");
+        assert_eq!(out[0]["size"], 1024);
+    }
 
     #[test]
     fn picks_allow_always_over_other_options() {
